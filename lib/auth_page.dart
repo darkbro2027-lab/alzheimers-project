@@ -111,16 +111,38 @@ class _AuthPageState extends State<AuthPage> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: <Widget>[
+                        Center(
+                          child: ClipOval(
+                            child: Image.asset(
+                              'assets/logo.png',
+                              width: 96,
+                              height: 96,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'BesideYou',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w900,
+                            color: Color(0xFF1F2A44),
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                        const SizedBox(height: 14),
                         Text(
                           _isLoginMode ? 'Welcome back' : 'Create account',
                           textAlign: TextAlign.center,
                           style: const TextStyle(
-                            fontSize: 24,
+                            fontSize: 20,
                             fontWeight: FontWeight.w800,
                             color: Color(0xFF1F2A44),
                           ),
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 6),
                         Text(
                           _isLoginMode
                               ? 'Log in to continue.'

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'home_page.dart';
 import 'cognitive_check_page.dart';
 import 'medication_page.dart';
@@ -10,6 +11,15 @@ import 'auth_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  const List<String> envCandidates = <String>['assets/env', 'assets/.env', '.env'];
+  for (final String envPath in envCandidates) {
+    try {
+      await dotenv.load(fileName: envPath);
+      break;
+    } catch (_) {
+      // Try next location. AI features remain disabled if none load.
+    }
+  }
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const MyApp());
 }
