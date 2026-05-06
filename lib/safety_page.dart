@@ -1,8 +1,8 @@
-import 'dart:convert';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:alzheimers_project/profile_page.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:alzheimers_project/services/guest_mode.dart';
+import 'package:alzheimers_project/services/user_data_service.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class SafetyPage extends StatefulWidget {
@@ -13,10 +13,7 @@ class SafetyPage extends StatefulWidget {
 }
 
 class _SafetyPageState extends State<SafetyPage> {
-  static const String _contactsStorageKey = 'safety_emergency_contacts';
-  static const String _locationShareKey = 'profile_location_sharing';
   final List<_EmergencyContact> _contacts = <_EmergencyContact>[];
-  bool _locationSharingEnabled = false;
   static const List<_ContactAvatarChoice> _avatarChoices = <_ContactAvatarChoice>[
     _ContactAvatarChoice(Icons.person_rounded, Color(0xFF3D7BE6)),
     _ContactAvatarChoice(Icons.person_outline_rounded, Color(0xFF2EA66A)),
@@ -34,132 +31,276 @@ class _SafetyPageState extends State<SafetyPage> {
 
   Future<void> _loadContacts() async {
     try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      final bool locationSharing = prefs.getBool(_locationShareKey) ?? false;
-      final List<String> raw =
-          prefs.getStringList(_contactsStorageKey) ?? <String>[];
-      final List<_EmergencyContact> loaded = raw
-          .map((item) {
-            try {
-              return _EmergencyContact.fromJson(
-                jsonDecode(item) as Map<String, dynamic>,
-              );
-            } catch (_) {
-              return null;
-            }
-          })
-          .whereType<_EmergencyContact>()
+      final snapshot = await UserDataService.instance
+          .contactsCol()
+          .orderBy('createdAt', descending: true)
+          .get();
+      final List<_EmergencyContact> loaded = snapshot.docs
+          .map((doc) => _EmergencyContact.fromDoc(doc.id, doc.data()))
           .toList();
 
       if (!mounted) return;
       setState(() {
-        _locationSharingEnabled = locationSharing;
         _contacts
           ..clear()
           ..addAll(loaded);
       });
     } catch (_) {
-      // Keep UI usable even if local storage has malformed data.
+      // Keep UI usable even if load fails.
     }
   }
 
-  Future<void> _saveContacts() async {
-    try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setStringList(
-        _contactsStorageKey,
-        _contacts
-            .map((contact) => jsonEncode(contact.toJson()))
-            .toList(growable: false),
-      );
-    } catch (_) {
-      // Ignore persistence errors; in-memory state remains available.
-    }
+  static bool _isValidPhone(String value) {
+    final String digits = value.replaceAll(RegExp(r'[^0-9]'), '');
+    return digits.length >= 7 && digits.length <= 15;
   }
 
-  Future<void> _showAddContactDialog() async {
-    String name = '';
-    String phone = '';
 
-    final _EmergencyContact? newContact = await showDialog<_EmergencyContact>(
+  Future<_EmergencyContact?> _showContactForm({
+    _EmergencyContact? initial,
+  }) {
+    return showDialog<_EmergencyContact>(
       context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('Add Emergency Contact'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              TextFormField(
-                initialValue: name,
-                onChanged: (value) => name = value,
-                decoration: const InputDecoration(labelText: 'Name'),
-              ),
-              const SizedBox(height: 8),
-              TextFormField(
-                initialValue: phone,
-                onChanged: (value) => phone = value,
-                keyboardType: TextInputType.phone,
-                decoration: const InputDecoration(labelText: 'Phone Number'),
-              ),
-            ],
-          ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                final String trimmedName = name.trim();
-                final String trimmedPhone = phone.trim();
-                if (trimmedName.isEmpty || trimmedPhone.isEmpty) return;
-                Navigator.pop(
-                  dialogContext,
-                  _EmergencyContact(
-                    name: trimmedName,
-                    phone: trimmedPhone,
-                    avatarIcon: _avatarChoices.first.icon,
-                    avatarColor: _avatarChoices.first.color,
-                  ),
-                );
-              },
-              child: const Text('Add'),
-            ),
-          ],
-        );
-      },
+      barrierColor: Colors.black54,
+      builder: (dialogContext) => _ContactFormDialog(
+        initial: initial,
+        avatarChoices: _avatarChoices,
+        isValidPhone: _isValidPhone,
+      ),
     );
+  }
 
+  Future<void> _addContact() async {
+    if (guestBlocked(context, feature: 'add emergency contacts')) return;
+    final _EmergencyContact? newContact = await _showContactForm();
     if (newContact == null || !mounted) return;
-    setState(() => _contacts.insert(0, newContact));
-    await _saveContacts();
+    final doc = await UserDataService.instance.contactsCol().add(<String, dynamic>{
+      ...newContact.toMap(),
+      'createdAt': FieldValue.serverTimestamp(),
+    });
     if (!mounted) return;
+    setState(() => _contacts.insert(0, newContact.copyWith(id: doc.id)));
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('${newContact.name} added as emergency contact.')),
     );
   }
 
+  Future<void> _editContact(int index) async {
+    if (guestBlocked(context, feature: 'edit contacts')) return;
+    final _EmergencyContact current = _contacts[index];
+    final _EmergencyContact? updated =
+        await _showContactForm(initial: current);
+    if (updated == null || !mounted) return;
+    final _EmergencyContact merged = updated.copyWith(id: current.id);
+    await UserDataService.instance
+        .contactsCol()
+        .doc(current.id)
+        .update(merged.toMap());
+    if (!mounted) return;
+    setState(() => _contacts[index] = merged);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('${updated.name} updated.')),
+    );
+  }
+
+  Future<void> _deleteContact(int index) async {
+    if (guestBlocked(context, feature: 'delete contacts')) return;
+    final _EmergencyContact contact = _contacts[index];
+    try {
+      await UserDataService.instance.contactsCol().doc(contact.id).delete();
+    } catch (_) {
+      // If remote delete fails we still remove locally.
+    }
+    if (!mounted) return;
+    setState(() => _contacts.removeAt(index));
+  }
+
   Future<void> _callNumber(String label, String number) async {
     final bool? confirmed = await showDialog<bool>(
       context: context,
+      barrierColor: Colors.black54,
       builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('Confirm Call'),
-          content: Text(
-            _locationSharingEnabled
-                ? 'Call $label at $number?\n\nLocation sharing is enabled for emergencies.'
-                : 'Call $label at $number?',
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding:
+              const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(22),
+            child: Container(
+              color: Colors.white,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: <Color>[
+                          Color(0xFF16A34A),
+                          Color(0xFF22C55E),
+                        ],
+                      ),
+                    ),
+                    child: Column(
+                      children: <Widget>[
+                        Container(
+                          width: 68,
+                          height: 68,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.2),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.55),
+                              width: 1.5,
+                            ),
+                          ),
+                          child: const Icon(
+                            Icons.call_rounded,
+                            size: 34,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Confirm Call',
+                          style: TextStyle(
+                            fontSize: 19,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        const Text(
+                          'This will open your phone dialer.',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: Colors.white70,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 20, 18, 16),
+                    child: Column(
+                      children: <Widget>[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 12,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF3F4FA),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              const Text(
+                                'Calling',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF5C6675),
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                label,
+                                style: const TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w800,
+                                  color: Color(0xFF202939),
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: <Widget>[
+                                  const Icon(
+                                    Icons.phone_rounded,
+                                    size: 16,
+                                    color: Color(0xFF3D7BE6),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    number,
+                                    style: const TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w700,
+                                      color: Color(0xFF3D7BE6),
+                                      letterSpacing: 0.3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: <Widget>[
+                            Expanded(
+                              child: OutlinedButton(
+                                onPressed: () =>
+                                    Navigator.pop(dialogContext, false),
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: const Color(0xFF5C6675),
+                                  side: const BorderSide(
+                                    color: Color(0xFFD6DAE3),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                                child: const Text(
+                                  'Cancel',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                onPressed: () =>
+                                    Navigator.pop(dialogContext, true),
+                                icon: const Icon(Icons.call_rounded, size: 18),
+                                label: const Text(
+                                  'Call',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF22C55E),
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Call'),
-            ),
-          ],
         );
       },
     );
@@ -215,14 +356,22 @@ class _SafetyPageState extends State<SafetyPage> {
     );
 
     if (selectedChoice == null || !mounted) return;
-    setState(() {
-      final _EmergencyContact contact = _contacts[index];
-      _contacts[index] = contact.copyWith(
-        avatarIcon: selectedChoice.icon,
-        avatarColor: selectedChoice.color,
-      );
-    });
-    await _saveContacts();
+    if (guestBlocked(context, feature: 'change avatars')) return;
+    final _EmergencyContact contact = _contacts[index];
+    final _EmergencyContact updated = contact.copyWith(
+      avatarIcon: selectedChoice.icon,
+      avatarColor: selectedChoice.color,
+    );
+    try {
+      await UserDataService.instance
+          .contactsCol()
+          .doc(contact.id)
+          .update(updated.toMap());
+    } catch (_) {
+      // Still update locally if remote write fails.
+    }
+    if (!mounted) return;
+    setState(() => _contacts[index] = updated);
   }
 
   @override
@@ -259,44 +408,6 @@ class _SafetyPageState extends State<SafetyPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: _locationSharingEnabled
-                            ? const Color(0xFF2EA66A)
-                            : const Color(0xFFD6DAE3),
-                      ),
-                    ),
-                    child: Row(
-                      children: <Widget>[
-                        Icon(
-                          _locationSharingEnabled
-                              ? Icons.location_on_rounded
-                              : Icons.location_disabled_rounded,
-                          color: _locationSharingEnabled
-                              ? const Color(0xFF2EA66A)
-                              : const Color(0xFF7B8493),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _locationSharingEnabled
-                                ? 'Location sharing is ON (from Profile).'
-                                : 'Location sharing is OFF (from Profile).',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w600,
-                              color: Color(0xFF273444),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 12),
                   Row(
                     children: <Widget>[
                       Container(
@@ -401,14 +512,29 @@ class _SafetyPageState extends State<SafetyPage> {
                             ),
                             PopupMenuButton<String>(
                               onSelected: (value) async {
-                                if (value == 'change_profile_picture') {
+                                if (value == 'edit') {
+                                  await _editContact(index);
+                                } else if (value == 'change_profile_picture') {
                                   await _showAvatarPicker(index);
                                 } else if (value == 'delete') {
-                                  setState(() => _contacts.removeAt(index));
-                                  await _saveContacts();
+                                  await _deleteContact(index);
                                 }
                               },
-                              itemBuilder: (context) => const <PopupMenuEntry<String>>[
+                              itemBuilder: (context) =>
+                                  const <PopupMenuEntry<String>>[
+                                PopupMenuItem<String>(
+                                  value: 'edit',
+                                  child: Row(
+                                    children: <Widget>[
+                                      Icon(
+                                        Icons.edit_rounded,
+                                        color: Color(0xFF3D7BE6),
+                                      ),
+                                      SizedBox(width: 8),
+                                      Text('Edit'),
+                                    ],
+                                  ),
+                                ),
                                 PopupMenuItem<String>(
                                   value: 'change_profile_picture',
                                   child: Row(
@@ -427,9 +553,9 @@ class _SafetyPageState extends State<SafetyPage> {
                                   child: Row(
                                     children: <Widget>[
                                       Icon(
-                                Icons.delete_outline_rounded,
-                                color: Color(0xFFEF4444),
-                              ),
+                                        Icons.delete_outline_rounded,
+                                        color: Color(0xFFEF4444),
+                                      ),
                                       SizedBox(width: 8),
                                       Text('Delete'),
                                     ],
@@ -445,7 +571,7 @@ class _SafetyPageState extends State<SafetyPage> {
                   SizedBox(
                     width: double.infinity,
                     child: OutlinedButton.icon(
-                      onPressed: _showAddContactDialog,
+                      onPressed: _addContact,
                       icon: const Icon(Icons.add),
                       label: const Text('Add Emergency Contact'),
                       style: OutlinedButton.styleFrom(
@@ -524,24 +650,28 @@ class _SafetyPageState extends State<SafetyPage> {
 
 class _EmergencyContact {
   const _EmergencyContact({
+    this.id = '',
     required this.name,
     required this.phone,
     required this.avatarIcon,
     required this.avatarColor,
   });
 
+  final String id;
   final String name;
   final String phone;
   final IconData avatarIcon;
   final Color avatarColor;
 
   _EmergencyContact copyWith({
+    String? id,
     String? name,
     String? phone,
     IconData? avatarIcon,
     Color? avatarColor,
   }) {
     return _EmergencyContact(
+      id: id ?? this.id,
       name: name ?? this.name,
       phone: phone ?? this.phone,
       avatarIcon: avatarIcon ?? this.avatarIcon,
@@ -549,7 +679,7 @@ class _EmergencyContact {
     );
   }
 
-  Map<String, dynamic> toJson() {
+  Map<String, dynamic> toMap() {
     return <String, dynamic>{
       'name': name,
       'phone': phone,
@@ -558,17 +688,18 @@ class _EmergencyContact {
     };
   }
 
-  factory _EmergencyContact.fromJson(Map<String, dynamic> json) {
-    final int iconCodePoint = json['avatarIconCodePoint'] is int
-        ? json['avatarIconCodePoint'] as int
+  factory _EmergencyContact.fromDoc(String id, Map<String, dynamic> data) {
+    final int iconCodePoint = data['avatarIconCodePoint'] is int
+        ? data['avatarIconCodePoint'] as int
         : Icons.person_rounded.codePoint;
-    final int colorValue = json['avatarColorValue'] is int
-        ? json['avatarColorValue'] as int
+    final int colorValue = data['avatarColorValue'] is int
+        ? data['avatarColorValue'] as int
         : const Color(0xFF3D7BE6).toARGB32();
 
     return _EmergencyContact(
-      name: (json['name'] ?? '').toString(),
-      phone: (json['phone'] ?? '').toString(),
+      id: id,
+      name: (data['name'] ?? '').toString(),
+      phone: (data['phone'] ?? '').toString(),
       avatarIcon: IconData(iconCodePoint, fontFamily: 'MaterialIcons'),
       avatarColor: Color(colorValue),
     );
@@ -580,4 +711,295 @@ class _ContactAvatarChoice {
 
   final IconData icon;
   final Color color;
+}
+
+class _ContactFormDialog extends StatefulWidget {
+  const _ContactFormDialog({
+    required this.initial,
+    required this.avatarChoices,
+    required this.isValidPhone,
+  });
+
+  final _EmergencyContact? initial;
+  final List<_ContactAvatarChoice> avatarChoices;
+  final bool Function(String) isValidPhone;
+
+  @override
+  State<_ContactFormDialog> createState() => _ContactFormDialogState();
+}
+
+class _ContactFormDialogState extends State<_ContactFormDialog> {
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+  late final TextEditingController _nameController;
+  late final TextEditingController _phoneController;
+  late _ContactAvatarChoice _selectedAvatar;
+
+  @override
+  void initState() {
+    super.initState();
+    final _EmergencyContact? initial = widget.initial;
+    _nameController = TextEditingController(text: initial?.name ?? '');
+    _phoneController = TextEditingController(text: initial?.phone ?? '');
+    _selectedAvatar = widget.avatarChoices.firstWhere(
+      (c) =>
+          c.icon.codePoint ==
+              (initial?.avatarIcon.codePoint ??
+                  widget.avatarChoices.first.icon.codePoint) &&
+          c.color.toARGB32() ==
+              (initial?.avatarColor.toARGB32() ??
+                  widget.avatarChoices.first.color.toARGB32()),
+      orElse: () => widget.avatarChoices.first,
+    );
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _phoneController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    Navigator.pop(
+      context,
+      _EmergencyContact(
+        name: _nameController.text.trim(),
+        phone: _phoneController.text.trim(),
+        avatarIcon: _selectedAvatar.icon,
+        avatarColor: _selectedAvatar.color,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isEditing = widget.initial != null;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(22),
+        child: Container(
+          color: Colors.white,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(20, 22, 20, 22),
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: <Color>[
+                      Color(0xFF6168D7),
+                      Color(0xFF3D7BE6),
+                    ],
+                  ),
+                ),
+                child: Column(
+                  children: <Widget>[
+                    Container(
+                      width: 62,
+                      height: 62,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.18),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.5),
+                          width: 1.4,
+                        ),
+                      ),
+                      child: Icon(
+                        _selectedAvatar.icon,
+                        size: 32,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      isEditing
+                          ? 'Edit Emergency Contact'
+                          : 'Add Emergency Contact',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Someone to reach in an emergency',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 18, 18, 14),
+                child: Form(
+                  key: _formKey,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      TextFormField(
+                        controller: _nameController,
+                        textCapitalization: TextCapitalization.words,
+                        decoration: InputDecoration(
+                          labelText: 'Name',
+                          prefixIcon:
+                              const Icon(Icons.person_outline_rounded),
+                          filled: true,
+                          fillColor: const Color(0xFFF3F4FA),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                        validator: (value) {
+                          if (value == null || value.trim().isEmpty) {
+                            return 'Please enter a name';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: _phoneController,
+                        keyboardType: TextInputType.phone,
+                        decoration: InputDecoration(
+                          labelText: 'Phone Number',
+                          prefixIcon: const Icon(Icons.phone_rounded),
+                          filled: true,
+                          fillColor: const Color(0xFFF3F4FA),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                        validator: (value) {
+                          if (value == null || value.trim().isEmpty) {
+                            return 'Please enter a phone number';
+                          }
+                          if (!widget.isValidPhone(value)) {
+                            return 'Enter a valid phone (7–15 digits)';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Profile picture',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF273444),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: widget.avatarChoices.map((choice) {
+                          final bool isSelected =
+                              choice.icon.codePoint ==
+                                      _selectedAvatar.icon.codePoint &&
+                                  choice.color.toARGB32() ==
+                                      _selectedAvatar.color.toARGB32();
+                          return InkWell(
+                            borderRadius: BorderRadius.circular(999),
+                            onTap: () {
+                              setState(() {
+                                _selectedAvatar = choice;
+                              });
+                            },
+                            child: Container(
+                              width: 46,
+                              height: 46,
+                              decoration: BoxDecoration(
+                                color: Color.lerp(
+                                  choice.color,
+                                  Colors.white,
+                                  0.8,
+                                ),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: isSelected
+                                      ? choice.color
+                                      : Colors.transparent,
+                                  width: 2.4,
+                                ),
+                              ),
+                              child: Icon(
+                                choice.icon,
+                                color: choice.color,
+                                size: 22,
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                      const SizedBox(height: 18),
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => Navigator.pop(context),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: const Color(0xFF5C6675),
+                                side: const BorderSide(
+                                  color: Color(0xFFD6DAE3),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 12,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                              child: const Text(
+                                'Cancel',
+                                style: TextStyle(fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: _submit,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF3D7BE6),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 12,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                              child: Text(
+                                isEditing ? 'Save' : 'Add Contact',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

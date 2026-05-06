@@ -1,7 +1,7 @@
-import 'dart:convert';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'services/guest_mode.dart';
+import 'services/user_data_service.dart';
 import 'profile_page.dart';
 
 class MedicationPage extends StatefulWidget {
@@ -12,8 +12,8 @@ class MedicationPage extends StatefulWidget {
 }
 
 class _MedicationPageState extends State<MedicationPage> {
-  static const String _medReminderKey = 'profile_medication_reminders';
   final List<_MedicationEntry> _medications = <_MedicationEntry>[];
+  final List<_MedicationHistoryEntry> _history = <_MedicationHistoryEntry>[];
   bool _showManageOptions = false;
   bool _medicationRemindersEnabled = true;
 
@@ -50,106 +50,151 @@ class _MedicationPageState extends State<MedicationPage> {
     );
   }
 
-  void _updateMedicationStatus(int index, String status) {
+  Future<void> _updateMedicationStatus(int index, String status) async {
     if (index < 0 || index >= _medications.length) {
       return;
     }
+    if (guestBlocked(context, feature: 'track medication')) return;
+    final _MedicationEntry entry = _medications[index];
+    final String stampIso = DateTime.now().toIso8601String();
+    final _MedicationHistoryEntry newHistoryEntry = _MedicationHistoryEntry(
+      name: entry.name,
+      amount: entry.amount,
+      timeLabel: entry.timeLabel,
+      status: status,
+      date: _todayKey,
+      recordedAt: stampIso,
+    );
+
     setState(() {
-      _medications[index] = _medications[index].copyWith(
+      _medications[index] = entry.copyWith(
         status: status,
         statusDate: _todayKey,
       );
+      _history.removeWhere(
+        (_MedicationHistoryEntry h) =>
+            h.name == entry.name && h.date == _todayKey,
+      );
+      _history.insert(0, newHistoryEntry);
     });
-    _saveMedications();
+
+    try {
+      await UserDataService.instance
+          .medicationsCol()
+          .doc(entry.id)
+          .update(<String, dynamic>{
+        'status': status,
+        'statusDate': _todayKey,
+      });
+      final String historyDocId = '${_todayKey}_${entry.id}';
+      await UserDataService.instance
+          .medicationHistoryCol()
+          .doc(historyDocId)
+          .set(<String, dynamic>{
+        ...newHistoryEntry.toMap(),
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+    } catch (_) {
+      // Local state already updated; remote write can be retried later.
+    }
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final snapshot = await UserDataService.instance
+          .medicationHistoryCol()
+          .orderBy('recordedAt', descending: true)
+          .get();
+      final List<_MedicationHistoryEntry> loaded = snapshot.docs
+          .map((doc) => _MedicationHistoryEntry.fromMap(doc.data()))
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _history
+          ..clear()
+          ..addAll(loaded);
+      });
+    } catch (_) {
+      // Fail-safe.
+    }
   }
 
   @override
   void initState() {
     super.initState();
     _loadMedications();
+    _loadHistory();
   }
 
   Future<void> _loadMedications() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    final bool remindersEnabled = prefs.getBool(_medReminderKey) ?? true;
-    final List<String> rawList =
-        prefs.getStringList('saved_medications') ?? <String>[];
-    final List<_MedicationEntry> loaded = rawList
-        .map((String item) {
-          try {
-            final Map<String, dynamic> data =
-                jsonDecode(item) as Map<String, dynamic>;
-            return _MedicationEntry.fromJson(data);
-          } catch (_) {
-            return null;
-          }
-        })
-        .whereType<_MedicationEntry>()
-        .toList();
+    try {
+      final profileSnap = await UserDataService.instance.profileDoc().get();
+      final bool remindersEnabled =
+          (profileSnap.data()?['medicationReminders'] as bool?) ?? true;
 
-    if (!mounted) {
-      return;
+      final snapshot = await UserDataService.instance.medicationsCol().get();
+      final List<_MedicationEntry> loaded = snapshot.docs
+          .map((doc) => _MedicationEntry.fromDoc(doc.id, doc.data()))
+          .toList();
+
+      if (!mounted) return;
+      setState(() {
+        _medicationRemindersEnabled = remindersEnabled;
+        _medications
+          ..clear()
+          ..addAll(loaded);
+        _sortMedicationsByTime();
+      });
+    } catch (_) {
+      // Fail-safe.
     }
-    setState(() {
-      _medicationRemindersEnabled = remindersEnabled;
-      _medications
-        ..clear()
-        ..addAll(loaded);
-      _sortMedicationsByTime();
-    });
-  }
-
-  Future<void> _saveMedications() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(
-      'saved_medications',
-      _medications
-          .map((entry) => jsonEncode(entry.toJson()))
-          .toList(growable: false),
-    );
   }
 
   Future<void> _openAddMedicationForm() async {
+    if (guestBlocked(context, feature: 'add medications')) return;
     final _MedicationEntry? newMedication = await Navigator.push<_MedicationEntry>(
       context,
       MaterialPageRoute(builder: (context) => const _AddMedicationFormPage()),
     );
 
-    if (newMedication != null) {
+    if (newMedication == null) return;
+    try {
+      final doc = await UserDataService.instance
+          .medicationsCol()
+          .add(newMedication.toMap());
+      if (!mounted) return;
       setState(() {
-        _medications.add(newMedication);
+        _medications.add(newMedication.copyWith(id: doc.id));
         _sortMedicationsByTime();
       });
-      _saveMedications();
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save medication.')),
+      );
     }
   }
 
   Future<void> _openManageMedications() async {
-    final List<_MedicationEntry>? updatedList = await Navigator.push<List<_MedicationEntry>>(
+    await Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) =>
-            _ManageMedicationsPage(initialMedications: List<_MedicationEntry>.from(_medications)),
+        builder: (context) => _ManageMedicationsPage(
+          initialMedications: List<_MedicationEntry>.from(_medications),
+        ),
       ),
     );
-
-    if (updatedList != null) {
-      setState(() {
-        _medications
-          ..clear()
-          ..addAll(updatedList);
-        _sortMedicationsByTime();
-        _showManageOptions = false;
-      });
-      _saveMedications();
-    }
+    if (!mounted) return;
+    setState(() => _showManageOptions = false);
+    await _loadMedications();
   }
 
   void _openMedicationRecords() {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => _MedicationRecordsPage(medications: _medications),
+        builder: (context) =>
+            _MedicationRecordsPage(history: List<_MedicationHistoryEntry>.from(_history)),
       ),
     );
   }
@@ -907,12 +952,28 @@ class _ManageMedicationsPage extends StatefulWidget {
 }
 
 class _MedicationRecordsPage extends StatelessWidget {
-  const _MedicationRecordsPage({required this.medications});
+  const _MedicationRecordsPage({required this.history});
 
-  final List<_MedicationEntry> medications;
+  final List<_MedicationHistoryEntry> history;
 
   @override
   Widget build(BuildContext context) {
+    final Map<String, List<_MedicationHistoryEntry>> byDate =
+        <String, List<_MedicationHistoryEntry>>{};
+    for (final _MedicationHistoryEntry h in history) {
+      byDate.putIfAbsent(h.date, () => <_MedicationHistoryEntry>[]).add(h);
+    }
+    final List<String> sortedDates = byDate.keys.toList()
+      ..sort((String a, String b) => b.compareTo(a));
+
+    final int takenCount =
+        history.where((h) => h.status == 'Taken').length;
+    final int missedCount =
+        history.where((h) => h.status == 'Missed').length;
+    final int totalCount = takenCount + missedCount;
+    final int adherencePercent =
+        totalCount == 0 ? 0 : ((takenCount / totalCount) * 100).round();
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Medication Records'),
@@ -935,7 +996,38 @@ class _MedicationRecordsPage extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(12),
           children: <Widget>[
-            if (medications.isEmpty)
+            Container(
+              padding: const EdgeInsets.all(14),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: const Color(0xFFD6DAE3), width: 1.4),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text(
+                    'Adherence Summary',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF273444),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '$adherencePercent%  ($takenCount taken / $missedCount missed)',
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF2E63DE),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (history.isEmpty)
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
@@ -943,25 +1035,13 @@ class _MedicationRecordsPage extends StatelessWidget {
                   borderRadius: BorderRadius.circular(14),
                 ),
                 child: const Text(
-                  'No medications saved yet.',
+                  'No medication records yet. Mark a medication as Taken or Missed to start a history.',
                   style: TextStyle(color: Color(0xFF4A5968), fontSize: 14),
                 ),
               )
             else
-              ...medications.map((entry) {
-                final bool isTaken = entry.status == 'Taken';
-                final bool isMissed = entry.status == 'Missed';
-                final String statusLabel = isTaken
-                    ? 'Taken'
-                    : isMissed
-                    ? 'Missed'
-                    : 'Not marked';
-                final Color statusColor = isTaken
-                    ? const Color(0xFF2EA66A)
-                    : isMissed
-                    ? const Color(0xFFB8860B)
-                    : const Color(0xFF7A8795);
-
+              ...sortedDates.map((String date) {
+                final List<_MedicationHistoryEntry> items = byDate[date]!;
                 return Container(
                   margin: const EdgeInsets.only(bottom: 12),
                   padding: const EdgeInsets.all(14),
@@ -977,64 +1057,52 @@ class _MedicationRecordsPage extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Text(
-                        entry.name,
+                        date,
                         style: const TextStyle(
-                          fontSize: 18,
+                          fontSize: 16,
                           fontWeight: FontWeight.bold,
                           color: Color(0xFF273444),
                         ),
                       ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'Amount: ${entry.amount}',
-                        style: const TextStyle(
-                          fontSize: 14,
-                          color: Color(0xFF4A5968),
-                        ),
-                      ),
-                      Text(
-                        'Time: ${entry.timeLabel}',
-                        style: const TextStyle(
-                          fontSize: 14,
-                          color: Color(0xFF4A5968),
-                        ),
-                      ),
-                      Text(
-                        'Days: ${entry.days.join(', ')}',
-                        style: const TextStyle(
-                          fontSize: 14,
-                          color: Color(0xFF4A5968),
-                        ),
-                      ),
-                      if (entry.statusDate.isNotEmpty)
-                        Text(
-                          'Date: ${entry.statusDate}',
-                          style: const TextStyle(
-                            fontSize: 14,
-                            color: Color(0xFF4A5968),
-                          ),
-                        ),
                       const SizedBox(height: 8),
-                      Row(
-                        children: <Widget>[
-                          const Text(
-                            'Status: ',
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Color(0xFF4A5968),
-                              fontWeight: FontWeight.w600,
-                            ),
+                      ...items.map((h) {
+                        final bool isTaken = h.status == 'Taken';
+                        final Color statusColor = isTaken
+                            ? const Color(0xFF2EA66A)
+                            : const Color(0xFFB8860B);
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Row(
+                            children: <Widget>[
+                              Icon(
+                                isTaken
+                                    ? Icons.check_circle_rounded
+                                    : Icons.cancel_rounded,
+                                size: 18,
+                                color: statusColor,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  '${h.name} (${h.amount}) @ ${h.timeLabel}',
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Color(0xFF273444),
+                                  ),
+                                ),
+                              ),
+                              Text(
+                                h.status,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: statusColor,
+                                ),
+                              ),
+                            ],
                           ),
-                          Text(
-                            statusLabel,
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: statusColor,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ],
-                      ),
+                        );
+                      }),
                     ],
                   ),
                 );
@@ -1063,6 +1131,7 @@ class _ManageMedicationsPageState extends State<_ManageMedicationsPage> {
   }
 
   Future<void> _editMedication(int index) async {
+    if (guestBlocked(context, feature: 'edit medications')) return;
     final _MedicationEntry current = _medications[index];
     final _MedicationEntry? edited = await Navigator.push<_MedicationEntry>(
       context,
@@ -1070,22 +1139,36 @@ class _ManageMedicationsPageState extends State<_ManageMedicationsPage> {
         builder: (context) => _AddMedicationFormPage(initialEntry: current),
       ),
     );
-    if (edited != null) {
-      setState(() {
-        _medications[index] = edited;
-        _sortMedicationsByTime();
-      });
+    if (edited == null) return;
+    final _MedicationEntry merged = edited.copyWith(id: current.id);
+    try {
+      await UserDataService.instance
+          .medicationsCol()
+          .doc(current.id)
+          .update(merged.toMap());
+    } catch (_) {
+      // Keep going; local state still updates.
     }
-  }
-
-  void _deleteMedication(int index) {
+    if (!mounted) return;
     setState(() {
-      _medications.removeAt(index);
+      _medications[index] = merged;
+      _sortMedicationsByTime();
     });
   }
 
-  void _closeWithResult() {
-    Navigator.pop(context, _medications);
+  Future<void> _deleteMedication(int index) async {
+    if (guestBlocked(context, feature: 'delete medications')) return;
+    final _MedicationEntry entry = _medications[index];
+    try {
+      await UserDataService.instance
+          .medicationsCol()
+          .doc(entry.id)
+          .delete();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _medications.removeAt(index);
+    });
   }
 
   @override
@@ -1095,7 +1178,7 @@ class _ManageMedicationsPageState extends State<_ManageMedicationsPage> {
         automaticallyImplyLeading: false,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
-          onPressed: _closeWithResult,
+          onPressed: () => Navigator.pop(context),
         ),
         title: const Text('Manage Medications'),
         backgroundColor: Colors.indigo[400],
@@ -1205,6 +1288,7 @@ class _ManageMedicationsPageState extends State<_ManageMedicationsPage> {
 
 class _MedicationEntry {
   const _MedicationEntry({
+    this.id = '',
     required this.name,
     required this.amount,
     required this.timeLabel,
@@ -1215,6 +1299,7 @@ class _MedicationEntry {
     required this.statusDate,
   });
 
+  final String id;
   final String name;
   final String amount;
   final String timeLabel;
@@ -1259,7 +1344,7 @@ class _MedicationEntry {
       IconData(iconCodePoint, fontFamily: 'MaterialIcons');
   Color get iconColor => Color(iconColorValue);
 
-  Map<String, dynamic> toJson() {
+  Map<String, dynamic> toMap() {
     return <String, dynamic>{
       'name': name,
       'amount': amount,
@@ -1272,30 +1357,32 @@ class _MedicationEntry {
     };
   }
 
-  factory _MedicationEntry.fromJson(Map<String, dynamic> json) {
+  factory _MedicationEntry.fromDoc(String id, Map<String, dynamic> data) {
     const int defaultIconCodePoint = 0xe3d2;
     const int defaultIconColorValue = 0xFF2EA66A;
     return _MedicationEntry(
-      name: (json['name'] ?? '').toString(),
-      amount: (json['amount'] ?? '').toString(),
-      timeLabel: (json['timeLabel'] ?? '').toString(),
-      days: (json['days'] is List)
-          ? (json['days'] as List)
+      id: id,
+      name: (data['name'] ?? '').toString(),
+      amount: (data['amount'] ?? '').toString(),
+      timeLabel: (data['timeLabel'] ?? '').toString(),
+      days: (data['days'] is List)
+          ? (data['days'] as List)
                 .map((item) => item.toString())
                 .toList(growable: false)
           : const <String>[],
-      iconCodePoint: (json['iconCodePoint'] is num)
-          ? (json['iconCodePoint'] as num).toInt()
+      iconCodePoint: (data['iconCodePoint'] is num)
+          ? (data['iconCodePoint'] as num).toInt()
           : defaultIconCodePoint,
-      iconColorValue: (json['iconColorValue'] is num)
-          ? (json['iconColorValue'] as num).toInt()
+      iconColorValue: (data['iconColorValue'] is num)
+          ? (data['iconColorValue'] as num).toInt()
           : defaultIconColorValue,
-      status: (json['status'] ?? '').toString(),
-      statusDate: (json['statusDate'] ?? '').toString(),
+      status: (data['status'] ?? '').toString(),
+      statusDate: (data['statusDate'] ?? '').toString(),
     );
   }
 
   _MedicationEntry copyWith({
+    String? id,
     String? name,
     String? amount,
     String? timeLabel,
@@ -1306,6 +1393,7 @@ class _MedicationEntry {
     String? statusDate,
   }) {
     return _MedicationEntry(
+      id: id ?? this.id,
       name: name ?? this.name,
       amount: amount ?? this.amount,
       timeLabel: timeLabel ?? this.timeLabel,
@@ -1328,4 +1416,42 @@ class _MedicationIconOption {
   final IconData icon;
   final Color color;
   final String label;
+}
+
+class _MedicationHistoryEntry {
+  const _MedicationHistoryEntry({
+    required this.name,
+    required this.amount,
+    required this.timeLabel,
+    required this.status,
+    required this.date,
+    required this.recordedAt,
+  });
+
+  final String name;
+  final String amount;
+  final String timeLabel;
+  final String status;
+  final String date;
+  final String recordedAt;
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+        'name': name,
+        'amount': amount,
+        'timeLabel': timeLabel,
+        'status': status,
+        'date': date,
+        'recordedAt': recordedAt,
+      };
+
+  factory _MedicationHistoryEntry.fromMap(Map<String, dynamic> data) {
+    return _MedicationHistoryEntry(
+      name: (data['name'] ?? '').toString(),
+      amount: (data['amount'] ?? '').toString(),
+      timeLabel: (data['timeLabel'] ?? '').toString(),
+      status: (data['status'] ?? '').toString(),
+      date: (data['date'] ?? '').toString(),
+      recordedAt: (data['recordedAt'] ?? '').toString(),
+    );
+  }
 }

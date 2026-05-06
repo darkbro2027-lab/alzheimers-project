@@ -1,8 +1,8 @@
-import 'dart:convert';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:alzheimers_project/profile_page.dart';
+import 'package:alzheimers_project/services/guest_mode.dart';
+import 'package:alzheimers_project/services/user_data_service.dart';
 
 class NotesRemindersPage extends StatefulWidget {
   const NotesRemindersPage({super.key});
@@ -12,9 +12,6 @@ class NotesRemindersPage extends StatefulWidget {
 }
 
 class _NotesRemindersPageState extends State<NotesRemindersPage> {
-  static const String _todayNotesKey = 'notes_reminders_today_notes';
-  static const String _previousNotesKey = 'notes_reminders_previous_notes';
-  static const String _lastOpenedDayKey = 'notes_reminders_last_opened_day';
   static const List<String> _quickTags = <String>[
     'Important',
     'Reminder',
@@ -74,55 +71,53 @@ class _NotesRemindersPageState extends State<NotesRemindersPage> {
   Future<void> _loadNotes() async {
     List<_NoteItem> loadedToday = <_NoteItem>[];
     List<_NoteItem> loadedPrevious = <_NoteItem>[];
-    bool needsSave = false;
 
     try {
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-      final List<String> rawToday =
-          prefs.getStringList(_todayNotesKey) ?? <String>[];
-      final List<String> rawPrevious =
-          prefs.getStringList(_previousNotesKey) ?? <String>[];
+      final todaySnap = await UserDataService.instance
+          .notesCol()
+          .where('bucket', isEqualTo: 'today')
+          .orderBy('createdAtMillis', descending: true)
+          .get();
+      final previousSnap = await UserDataService.instance
+          .notesCol()
+          .where('bucket', isEqualTo: 'previous')
+          .orderBy('createdAtMillis', descending: true)
+          .get();
 
-      loadedToday = rawToday
-          .map((item) {
-            try {
-              return _NoteItem.fromJson(jsonDecode(item) as Map<String, dynamic>);
-            } catch (_) {
-              return null;
-            }
-          })
-          .whereType<_NoteItem>()
+      loadedToday = todaySnap.docs
+          .map((doc) => _NoteItem.fromDoc(doc.id, doc.data()))
           .toList();
-
-      loadedPrevious = rawPrevious
-          .map((item) {
-            try {
-              return _NoteItem.fromJson(jsonDecode(item) as Map<String, dynamic>);
-            } catch (_) {
-              return null;
-            }
-          })
-          .whereType<_NoteItem>()
+      loadedPrevious = previousSnap.docs
+          .map((doc) => _NoteItem.fromDoc(doc.id, doc.data()))
           .toList();
 
       final String todayKey = _todayKey();
-      final String? lastOpenedDay = prefs.getString(_lastOpenedDayKey);
+      final metaSnap = await UserDataService.instance.metaDoc().get();
+      final String? lastOpenedDay =
+          metaSnap.data()?['notesLastOpenedDay'] as String?;
 
       if (lastOpenedDay != null &&
           lastOpenedDay != todayKey &&
           loadedToday.isNotEmpty) {
-        // New day: move yesterday's "today notes" into previous notes.
+        // New day: move yesterday's "today notes" into previous notes (remote + local).
+        final batch = FirebaseFirestore.instance.batch();
+        for (final _NoteItem note in loadedToday) {
+          batch.update(
+            UserDataService.instance.notesCol().doc(note.id),
+            <String, dynamic>{'bucket': 'previous'},
+          );
+        }
+        await batch.commit();
         loadedPrevious.insertAll(0, loadedToday);
         loadedToday = <_NoteItem>[];
-        needsSave = true;
       }
 
-      await prefs.setString(_lastOpenedDayKey, todayKey);
-      if (lastOpenedDay == null) {
-        needsSave = true;
-      }
+      await UserDataService.instance.metaDoc().set(
+        <String, dynamic>{'notesLastOpenedDay': todayKey},
+        SetOptions(merge: true),
+      );
     } catch (_) {
-      // Fail-safe: still render the page even if loading from disk fails.
+      // Fail-safe: still render the page even if remote load fails.
     }
 
     if (!mounted) return;
@@ -135,25 +130,6 @@ class _NotesRemindersPageState extends State<NotesRemindersPage> {
         ..addAll(loadedPrevious);
       _isLoading = false;
     });
-
-    if (needsSave) {
-      await _saveNotes();
-    }
-  }
-
-  Future<void> _saveNotes() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(
-      _todayNotesKey,
-      _todayNotes.map((note) => jsonEncode(note.toJson())).toList(growable: false),
-    );
-    await prefs.setStringList(
-      _previousNotesKey,
-      _previousNotes
-          .map((note) => jsonEncode(note.toJson()))
-          .toList(growable: false),
-    );
-    await prefs.setString(_lastOpenedDayKey, _todayKey());
   }
 
   Future<void> _addQuickNote() async {
@@ -164,30 +140,42 @@ class _NotesRemindersPageState extends State<NotesRemindersPage> {
       ).showSnackBar(const SnackBar(content: Text('Please enter a note first.')));
       return;
     }
+    if (guestBlocked(context, feature: 'save notes')) return;
 
     final String description = _quickNoteDescriptionController.text.trim();
     final Color tagColor = _quickTagColor(_selectedQuickTag);
+    final _NoteItem draft = _NoteItem(
+      title: title,
+      description: description.isEmpty ? 'No description' : description,
+      tag: _selectedQuickTag,
+      time: _timeLabel(TimeOfDay.now()),
+      createdDateLabel: _todayDateLabel(),
+      accentColor: tagColor,
+      tagColor: tagColor,
+    );
 
-    setState(() {
-      _todayNotes.insert(
-        0,
-        _NoteItem(
-          title: title,
-          description: description.isEmpty ? 'No description' : description,
-          tag: _selectedQuickTag,
-          time: _timeLabel(TimeOfDay.now()),
-          createdDateLabel: _todayDateLabel(),
-          accentColor: tagColor,
-          tagColor: tagColor,
-        ),
+    try {
+      final doc = await UserDataService.instance.notesCol().add(<String, dynamic>{
+        ...draft.toMap(),
+        'bucket': 'today',
+        'createdAtMillis': DateTime.now().millisecondsSinceEpoch,
+      });
+      if (!mounted) return;
+      setState(() {
+        _todayNotes.insert(0, draft.copyWith(id: doc.id));
+        _quickNoteTitleController.clear();
+        _quickNoteDescriptionController.clear();
+        _selectedQuickTag = 'Important';
+        _isQuickNoteExpanded = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save note.')),
       );
-      _quickNoteTitleController.clear();
-      _quickNoteDescriptionController.clear();
-      _selectedQuickTag = 'Important';
-      _isQuickNoteExpanded = false;
-    });
+      return;
+    }
     _quickNoteFocusNode.unfocus();
-    await _saveNotes();
   }
 
   Future<void> _showEditNoteDialog({
@@ -275,14 +263,39 @@ class _NotesRemindersPageState extends State<NotesRemindersPage> {
     );
 
     if (savedNote != null && mounted) {
-      setState(() {
+      if (guestBlocked(context, feature: 'save notes')) return;
+      final bool isToday = identical(targetList, _todayNotes);
+      final String bucket = isToday ? 'today' : 'previous';
+      try {
         if (editIndex == null) {
-          targetList.insert(0, savedNote);
+          final doc = await UserDataService.instance
+              .notesCol()
+              .add(<String, dynamic>{
+            ...savedNote.toMap(),
+            'bucket': bucket,
+            'createdAtMillis': DateTime.now().millisecondsSinceEpoch,
+          });
+          setState(() {
+            targetList.insert(0, savedNote.copyWith(id: doc.id));
+          });
         } else {
-          targetList[editIndex] = savedNote;
+          final _NoteItem prior = targetList[editIndex];
+          final _NoteItem merged = savedNote.copyWith(id: prior.id);
+          await UserDataService.instance
+              .notesCol()
+              .doc(prior.id)
+              .update(merged.toMap());
+          setState(() {
+            targetList[editIndex] = merged;
+          });
         }
-      });
-      await _saveNotes();
+      } catch (_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not save note.')),
+        );
+        return;
+      }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -317,11 +330,16 @@ class _NotesRemindersPageState extends State<NotesRemindersPage> {
     );
 
     if (confirmed != true) return;
+    if (!mounted) return;
+    if (guestBlocked(context, feature: 'delete notes')) return;
+    final _NoteItem note = targetList[index];
+    try {
+      await UserDataService.instance.notesCol().doc(note.id).delete();
+    } catch (_) {}
+    if (!mounted) return;
     setState(() {
       targetList.removeAt(index);
     });
-    await _saveNotes();
-    if (!mounted) return;
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Note deleted.')));
@@ -801,6 +819,7 @@ class _NotesRemindersPageState extends State<NotesRemindersPage> {
 
 class _NoteItem {
   const _NoteItem({
+    this.id = '',
     required this.title,
     required this.description,
     required this.tag,
@@ -810,6 +829,7 @@ class _NoteItem {
     required this.tagColor,
   });
 
+  final String id;
   final String title;
   final String description;
   final String tag;
@@ -818,7 +838,29 @@ class _NoteItem {
   final Color accentColor;
   final Color tagColor;
 
-  Map<String, dynamic> toJson() {
+  _NoteItem copyWith({
+    String? id,
+    String? title,
+    String? description,
+    String? tag,
+    String? time,
+    String? createdDateLabel,
+    Color? accentColor,
+    Color? tagColor,
+  }) {
+    return _NoteItem(
+      id: id ?? this.id,
+      title: title ?? this.title,
+      description: description ?? this.description,
+      tag: tag ?? this.tag,
+      time: time ?? this.time,
+      createdDateLabel: createdDateLabel ?? this.createdDateLabel,
+      accentColor: accentColor ?? this.accentColor,
+      tagColor: tagColor ?? this.tagColor,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
     return <String, dynamic>{
       'title': title,
       'description': description,
@@ -830,24 +872,21 @@ class _NoteItem {
     };
   }
 
-  factory _NoteItem.fromJson(Map<String, dynamic> json) {
-    final int accentValue = json['accentColorValue'] is int
-        ? json['accentColorValue'] as int
-        : (json['accentColor'] is int
-              ? json['accentColor'] as int
-              : const Color(0xFF3D7BE6).toARGB32());
-    final int tagValue = json['tagColorValue'] is int
-        ? json['tagColorValue'] as int
-        : (json['tagColor'] is int
-              ? json['tagColor'] as int
-              : const Color(0xFF3D7BE6).toARGB32());
+  factory _NoteItem.fromDoc(String id, Map<String, dynamic> data) {
+    final int accentValue = data['accentColorValue'] is int
+        ? data['accentColorValue'] as int
+        : const Color(0xFF3D7BE6).toARGB32();
+    final int tagValue = data['tagColorValue'] is int
+        ? data['tagColorValue'] as int
+        : const Color(0xFF3D7BE6).toARGB32();
 
     return _NoteItem(
-      title: (json['title'] ?? '').toString(),
-      description: (json['description'] ?? '').toString(),
-      tag: (json['tag'] ?? '').toString(),
-      time: (json['time'] ?? '').toString(),
-      createdDateLabel: (json['createdDateLabel'] ?? '').toString(),
+      id: id,
+      title: (data['title'] ?? '').toString(),
+      description: (data['description'] ?? '').toString(),
+      tag: (data['tag'] ?? '').toString(),
+      time: (data['time'] ?? '').toString(),
+      createdDateLabel: (data['createdDateLabel'] ?? '').toString(),
       accentColor: Color(accentValue),
       tagColor: Color(tagValue),
     );
